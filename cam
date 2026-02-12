@@ -1,0 +1,147 @@
+#!/bin/bash
+# cam - Simple camera CLI for Raspberry Pi
+
+set -e
+
+CAM_DIR="${CAM_DIR:-$HOME/recordings}"
+CAM_RES="${CAM_RES:-1920x1080}"
+CAM_FPS="${CAM_FPS:-30}"
+CAM_PID="/tmp/cam_recording.pid"
+
+WIDTH="${CAM_RES%x*}"
+HEIGHT="${CAM_RES#*x}"
+
+mkdir -p "$CAM_DIR"
+
+ts() { date +%Y%m%d_%H%M%S; }
+ok() { echo -e "\033[0;32m✓\033[0m $1"; }
+err() { echo -e "\033[0;31m✗\033[0m $1" >&2; }
+info() { echo -e "\033[0;34m→\033[0m $1"; }
+
+parse_dur() {
+    local n="${1%[smhSMH]}" u="${1#${1%[smhSMH]}}"
+    case "${u,,}" in
+        h) echo $((n*3600)) ;; m) echo $((n*60)) ;; *) echo "$n" ;;
+    esac
+}
+
+cmd_snap() {
+    local out="$CAM_DIR/photo_$(ts).jpg" n=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -o) out="$2"; shift 2 ;; -n) n="$2"; shift 2 ;; *) shift ;; esac
+    done
+    for ((i=1;i<=n;i++)); do
+        [[ $n -gt 1 ]] && out="$CAM_DIR/photo_$(ts).jpg"
+        info "Capturing..."
+        rpicam-still -t 500 --width "$WIDTH" --height "$HEIGHT" -o "$out" -v 0 2>/dev/null
+        ok "Saved: $out"
+        [[ $n -gt 1 ]] && sleep 0.5
+    done
+}
+
+cmd_record() {
+    local dur="${1:-10}" out=""
+    shift 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+    done
+    local secs=$(parse_dur "$dur") t=$(ts)
+    local h264="$CAM_DIR/video_${t}.h264"
+    local mp4="${out:-$CAM_DIR/video_${t}.mp4}"
+    info "Recording ${secs}s..."
+    rpicam-vid -t $((secs*1000)) --width "$WIDTH" --height "$HEIGHT" --framerate "$CAM_FPS" -o "$h264" -v 0 2>/dev/null
+    info "Converting..."
+    ffmpeg -y -framerate "$CAM_FPS" -i "$h264" -c copy "$mp4" -v quiet 2>/dev/null
+    rm -f "$h264"
+    ok "Saved: $mp4"
+}
+
+cmd_start() {
+    [[ -f "$CAM_PID" ]] && kill -0 "$(cat "$CAM_PID")" 2>/dev/null && { err "Already recording"; return 1; }
+    local t=$(ts)
+    info "Starting continuous recording..."
+    nohup rpicam-vid -t 0 --width "$WIDTH" --height "$HEIGHT" --framerate "$CAM_FPS" \
+        --segment 600000 -o "$CAM_DIR/video_${t}_%04d.h264" -v 0 >/dev/null 2>&1 &
+    echo $! > "$CAM_PID"
+    ok "Recording (PID: $!)"
+}
+
+cmd_stop() {
+    [[ ! -f "$CAM_PID" ]] && { err "Not recording"; return 1; }
+    kill "$(cat "$CAM_PID")" 2>/dev/null && ok "Stopped"
+    rm -f "$CAM_PID"
+    info "Converting..."
+    for f in "$CAM_DIR"/*.h264; do
+        [[ -f "$f" ]] || continue
+        ffmpeg -y -framerate "$CAM_FPS" -i "$f" -c copy "${f%.h264}.mp4" -v quiet 2>/dev/null && rm -f "$f"
+        ok "Converted: ${f%.h264}.mp4"
+    done
+}
+
+cmd_status() {
+    echo "Camera Status"
+    echo "─────────────────────────────"
+    rpicam-still --list-cameras 2>&1 | grep -q "imx219" && echo "Camera:    Connected (IMX219)" || echo "Camera:    Not detected"
+    [[ -f "$CAM_PID" ]] && kill -0 "$(cat "$CAM_PID")" 2>/dev/null && echo "Recording: Active" || echo "Recording: Idle"
+    echo "Disk free: $(df -h "$CAM_DIR" | awk NR==2{print $4})"
+    echo "Photos:    $(ls "$CAM_DIR"/*.jpg 2>/dev/null | wc -l | tr -d ' ')"
+    echo "Videos:    $(ls "$CAM_DIR"/*.mp4 2>/dev/null | wc -l | tr -d ' ')"
+    echo "─────────────────────────────"
+    echo "Resolution: $CAM_RES @ ${CAM_FPS}fps"
+}
+
+cmd_list() {
+    echo "Recordings ($CAM_DIR)"
+    echo "─────────────────────────────"
+    ls -lht "$CAM_DIR"/*.jpg "$CAM_DIR"/*.mp4 2>/dev/null | head -20 | while read -r line; do
+        echo "$line" | awk '{print $9, $5}'
+    done || echo "No files"
+}
+
+cmd_last() {
+    local f=$(ls -t "$CAM_DIR"/*.jpg "$CAM_DIR"/*.mp4 2>/dev/null | head -1)
+    [[ -n "$f" ]] && ok "Last: $f" && ls -lh "$f" || err "No files"
+}
+
+cmd_clean() {
+    [[ "$1" == "-f" ]] && { rm -f "$CAM_DIR"/*.{jpg,mp4,h264} 2>/dev/null; ok "Cleaned"; return; }
+    ls -lh "$CAM_DIR" 2>/dev/null
+    echo "Run: cam clean -f"
+}
+
+cmd_help() {
+    cat << HELP
+cam - Simple Pi Camera CLI
+
+COMMANDS:
+  snap [-n N] [-o FILE]   Take photo(s)
+  record <DUR> [-o FILE]  Record video (e.g., 30, 5m, 1h)
+  start                   Start continuous recording
+  stop                    Stop recording
+  status                  Show status
+  list                    List recordings  
+  last                    Show last capture
+  clean [-f]              Delete all (-f to confirm)
+
+EXAMPLES:
+  cam snap                Take a photo
+  cam snap -n 5           Take 5 photos
+  cam record 30           Record 30 seconds
+  cam record 2m           Record 2 minutes
+  cam start               Start continuous
+  cam stop                Stop and convert
+HELP
+}
+
+case "${1:-help}" in
+    snap|s|photo|p) shift; cmd_snap "$@" ;;
+    record|rec|r)   shift; cmd_record "$@" ;;
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    status|st)      cmd_status ;;
+    list|ls|l)      cmd_list ;;
+    last)           cmd_last ;;
+    clean|rm)       shift; cmd_clean "$@" ;;
+    help|-h)        cmd_help ;;
+    *)              err "Unknown: $1"; cmd_help ;;
+esac
